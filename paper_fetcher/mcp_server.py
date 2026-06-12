@@ -27,8 +27,20 @@ _fetcher: PaperFetcher | None = None
 def _get_fetcher() -> PaperFetcher:
     global _fetcher
     if _fetcher is None:
-        _fetcher = PaperFetcher(Config.load())
+        # Non-interactive: the MCP server can't open a login browser, so on an
+        # expired session it reports back instead of hanging.
+        _fetcher = PaperFetcher(Config.load(), interactive=False)
     return _fetcher
+
+
+_LOGIN_HINT = (
+    "\n\n---\n"
+    "⚠️ **HKU EZproxy 登录已过期（或尚未登录）**，付费墙全文无法获取。\n"
+    "请在终端运行一次：\n\n"
+    "```\npaper-fetcher login\n```\n\n"
+    "浏览器弹出后登录 HKU，cookie 会保存下来；登录后重新调用本工具即可。\n"
+    "（cookie 有效期较短，过期后重跑上面这条命令即可。）"
+)
 
 
 @mcp.tool()
@@ -45,15 +57,34 @@ async def fetch_paper(identifier: str, format: str = "markdown") -> str:
     fetcher = _get_fetcher()
     paper = fetcher.fetch(identifier)
 
-    if not paper.full_text and not paper.abstract:
-        return f"Could not extract full text for: {identifier}\nTitle: {paper.title}\nURL: {paper.url}"
+    # If EZproxy login is needed (and we couldn't get full text), tell the user
+    # exactly how to fix it instead of silently returning an abstract or nothing.
+    login_needed = fetcher._auth is not None and fetcher._auth.session_expired
 
     if format == "json":
-        return paper.to_json()
+        body = paper.to_json()
     elif format == "text":
-        return paper.to_text()
+        body = paper.to_text()
     else:
-        return paper.to_markdown(include_pdf_path=True)
+        body = paper.to_markdown(include_pdf_path=True)
+
+    if not paper.full_text:
+        if login_needed:
+            header = (
+                f"Only metadata/abstract available for: {identifier}\n"
+                f"Title: {paper.title}\nURL: {paper.url}"
+                if paper.abstract
+                else f"Could not retrieve full text for: {identifier}\n"
+                f"Title: {paper.title}\nURL: {paper.url}"
+            )
+            return header + _LOGIN_HINT
+        if not paper.abstract:
+            return (
+                f"Could not extract full text for: {identifier}\n"
+                f"Title: {paper.title}\nURL: {paper.url}"
+            )
+
+    return body
 
 
 @mcp.tool()

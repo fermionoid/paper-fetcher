@@ -40,11 +40,14 @@ PUBLISHER_PDF_TEMPLATES = {
 class PaperFetcher:
     """Main class for fetching academic papers."""
 
-    def __init__(self, config: Config | None = None):
+    def __init__(self, config: Config | None = None, interactive: bool = True):
         self.config = config or Config.load()
         self.config.ensure_dirs()
         self._auth: EZProxyAuth | None = None
         self._last_request_time = 0.0
+        # When False (e.g. MCP server), never open a login browser; instead
+        # report that EZproxy login is required so the user can run it manually.
+        self.interactive = interactive
 
     @property
     def auth(self) -> EZProxyAuth:
@@ -283,7 +286,7 @@ class PaperFetcher:
         logger.info("Trying constructed publisher PDF URL: %s", pdf_url)
 
         # Ensure authenticated
-        if not self.auth.login():
+        if not self.auth.login(interactive=self.interactive):
             logger.error("EZproxy authentication failed.")
             return None
 
@@ -332,7 +335,7 @@ class PaperFetcher:
     def _fetch_via_ezproxy(self, url: str, paper: Paper) -> Paper:
         """Fetch paper through EZproxy authenticated session."""
         # Ensure we're authenticated
-        if not self.auth.login():
+        if not self.auth.login(interactive=self.interactive):
             logger.error("EZproxy authentication failed.")
             return paper
 

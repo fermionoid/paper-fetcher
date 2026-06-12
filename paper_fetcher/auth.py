@@ -28,6 +28,10 @@ class EZProxyAuth:
         self.config.ensure_dirs()
         self._session: requests.Session | None = None
         self._driver: webdriver.Chrome | None = None
+        # Set True when a login was needed but skipped/failed in non-interactive
+        # mode (e.g. MCP server). Lets callers surface a "please log in" message
+        # instead of silently returning empty results.
+        self.session_expired = False
 
     @property
     def session(self) -> requests.Session:
@@ -43,24 +47,39 @@ class EZProxyAuth:
             })
         return self._session
 
-    def login(self, force: bool = False) -> bool:
+    def login(self, force: bool = False, interactive: bool = True) -> bool:
         """Ensure we have a valid EZproxy session.
 
         If cookies exist and are valid, reuses them.
-        Otherwise opens a browser for manual login.
+        Otherwise opens a browser for manual login (interactive mode only).
 
         Args:
             force: If True, ignore saved cookies and force re-login.
+            interactive: If False, never open a browser. When cookies are
+                missing/expired, set session_expired and return False so the
+                caller can ask the user to run `paper-fetcher login` instead
+                of blocking on a browser (used by the MCP server).
 
         Returns:
             True if authentication succeeded.
         """
         if not force and self._try_load_cookies():
             logger.info("Loaded saved cookies - session is valid.")
+            self.session_expired = False
             return True
 
+        if not interactive:
+            logger.warning(
+                "EZproxy session missing/expired and running non-interactively "
+                "- skipping browser login."
+            )
+            self.session_expired = True
+            return False
+
         logger.info("No valid session found. Opening browser for login...")
-        return self._browser_login()
+        ok = self._browser_login()
+        self.session_expired = not ok
+        return ok
 
     def _try_load_cookies(self) -> bool:
         """Try to load cookies from file and validate them."""
