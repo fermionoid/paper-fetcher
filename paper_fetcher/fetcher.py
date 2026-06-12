@@ -7,7 +7,7 @@ import random
 import re
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 
@@ -90,7 +90,11 @@ class PaperFetcher:
         # Step 2: Resolve DOI to URL if needed
         if doi and not url:
             url = self._resolve_doi(doi)
-            paper.url = url or ""
+
+        # Normalize redirect-stub URLs (e.g. linkinghub.elsevier.com) to real article pages
+        if url:
+            url = self._normalize_publisher_url(url)
+            paper.url = url
 
         if not url:
             logger.error("Could not determine URL for: %s", identifier)
@@ -265,6 +269,13 @@ class PaperFetcher:
             pdf_url = resolved_url.replace("/articlelanding/", "/articlepdf/")
             if pdf_url == resolved_url:
                 pdf_url = None  # Pattern didn't match
+        elif "sciencedirect.com" in hostname:
+            m = re.search(r"/pii/([A-Za-z0-9()\-]+)", parsed.path)
+            if m:
+                pdf_url = (
+                    f"https://www.sciencedirect.com/science/article/pii/"
+                    f"{m.group(1)}/pdfft?isDTMRedir=true&download=true"
+                )
 
         if not pdf_url:
             return None
@@ -281,6 +292,18 @@ class PaperFetcher:
             resp = self.auth.fetch(pdf_url)
             resp.raise_for_status()
             ct = resp.headers.get("content-type", "").lower()
+
+            # ScienceDirect /pdfft may return a small HTML page that redirects
+            # to the real PDF on sciencedirectassets.com — follow it once.
+            if "html" in ct:
+                redirect_url = self._extract_pdf_redirect(resp.text)
+                if redirect_url:
+                    redirect_url = urljoin(resp.url, redirect_url)
+                    logger.info("Following intermediate PDF redirect: %s", redirect_url)
+                    self._rate_limit()
+                    resp = self.auth.fetch(redirect_url)
+                    resp.raise_for_status()
+                    ct = resp.headers.get("content-type", "").lower()
 
             if "pdf" in ct and len(resp.content) > 10000:
                 pdf_bytes = resp.content
@@ -333,11 +356,13 @@ class PaperFetcher:
             return paper
 
         # HTML response - extract content
-        extracted = html_extractor.extract(resp.text, resp.url)
+        # Use the un-proxied URL so publisher adapters/heuristics match
+        real_url = self._unproxy_url(resp.url)
+        extracted = html_extractor.extract(resp.text, real_url)
         self._apply_extracted(paper, extracted)
 
         # Always try to find and download PDF for local storage
-        pdf_url = self._find_pdf_link(resp.text, resp.url)
+        pdf_url = self._find_pdf_link(resp.text, real_url)
         if pdf_url:
             logger.info("Found PDF link in HTML, downloading: %s", pdf_url)
             self._rate_limit()
@@ -427,6 +452,11 @@ class PaperFetcher:
         if "pubs.rsc.org" in hostname and "/articlelanding/" in path:
             return base_url.replace("/articlelanding/", "/articlepdf/")
 
+        if "sciencedirect" in hostname and "/pii/" in path and "/pdfft" not in path:
+            m = re.search(r"/pii/([A-Za-z0-9()\-]+)", path)
+            if m:
+                return f"{base}/science/article/pii/{m.group(1)}/pdfft?isDTMRedir=true&download=true"
+
         if "tandfonline.com" in hostname and "/doi/" in path and "/pdf/" not in path:
             # /doi/full/10.xxx → /doi/pdf/10.xxx
             doi_part = re.sub(r"/doi/(?:full|abs)/", "/doi/pdf/", path)
@@ -434,6 +464,67 @@ class PaperFetcher:
                 return f"{base}{doi_part}"
 
         return None
+
+    def _unproxy_url(self, url: str) -> str:
+        """Convert an EZproxy-rewritten URL back to the original publisher URL.
+
+        EZproxy rewrites hostnames: www.sciencedirect.com becomes
+        www-sciencedirect-com.eproxy.lib.hku.hk (dots → hyphens, original
+        hyphens → double hyphens). Adapters and PDF-link heuristics match on
+        the real hostname, so decode before passing URLs to them.
+        """
+        parsed = urlparse(url)
+        host = parsed.netloc
+        suffix = "." + EZPROXY_DOMAIN
+        if not host.endswith(suffix):
+            return url
+        encoded = host[: -len(suffix)]
+        real_host = (
+            encoded.replace("--", "\x00").replace("-", ".").replace("\x00", "-")
+        )
+        return urlunparse(parsed._replace(scheme="https", netloc=real_host))
+
+    def _extract_pdf_redirect(self, html: str) -> str | None:
+        """Find the real PDF URL inside an intermediate redirect page.
+
+        ScienceDirect's /pdfft endpoint returns a stub page pointing at
+        pdf.sciencedirectassets.com via a link, meta refresh, or JS redirect.
+        """
+        # Direct link to the PDF asset host
+        m = re.search(r'https://pdf\.sciencedirectassets\.com/[^"\'<>\s]+', html)
+        if m:
+            return m.group(0).replace("&amp;", "&")
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+
+        # Meta refresh: <meta http-equiv="refresh" content="0; url='...'">
+        meta = soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
+        if meta and meta.get("content"):
+            m = re.search(r"url\s*=\s*['\"]?([^'\">\s]+)", meta["content"], re.I)
+            if m:
+                return m.group(1)
+
+        # JS redirect: window.location = "..."
+        m = re.search(r"window\.location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]", html)
+        if m:
+            return m.group(1)
+
+        return None
+
+    def _normalize_publisher_url(self, url: str) -> str:
+        """Rewrite known redirect-stub URLs to the real article page.
+
+        Elsevier DOIs resolve to linkinghub.elsevier.com, which is a tiny
+        meta-refresh page that requests cannot follow. The PII in its path
+        maps directly to the ScienceDirect article URL.
+        """
+        m = re.search(r"linkinghub\.elsevier\.com/retrieve/pii/([A-Za-z0-9()\-]+)", url)
+        if m:
+            sd_url = f"https://www.sciencedirect.com/science/article/pii/{m.group(1)}"
+            logger.info("Rewrote linkinghub URL to ScienceDirect: %s", sd_url)
+            return sd_url
+        return url
 
     def _resolve_url(self, href: str, base: str) -> str:
         """Resolve a relative URL against a base."""
