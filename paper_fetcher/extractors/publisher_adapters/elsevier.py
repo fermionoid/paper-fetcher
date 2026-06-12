@@ -74,26 +74,57 @@ def _extract_abstract(soup: BeautifulSoup) -> str:
 def _extract_body(soup: BeautifulSoup) -> str:
     parts = []
 
-    # ScienceDirect article body
-    body = soup.select_one("div#body") or soup.select_one("div.Body")
+    # ScienceDirect article body. The container id/class has varied across
+    # site versions; try the known ones plus a fuzzy id match.
+    body = (
+        soup.select_one("div#body")
+        or soup.select_one("div.Body")
+        or soup.select_one("section.Body")
+        or soup.select_one("div[id^='body']")
+    )
+
     if body:
+        # The complete body text — used as the source of truth and as a
+        # fallback when structured extraction misses nested sections.
+        raw = _clean(body.get_text(" "))
+
+        # Try to structure by direct-child sections (works on older SD layouts).
         for section in body.find_all("section", recursive=False):
             heading = section.find(re.compile(r"h[2-4]"))
             heading_text = heading.get_text(strip=True) if heading else ""
-            content = _clean(section.get_text())
+            content = _clean(section.get_text(" "))
             if heading_text and content:
                 parts.append(f"## {heading_text}\n\n{content}")
             elif content:
                 parts.append(content)
 
-    if not parts and body:
-        parts.append(_clean(body.get_text()))
+        structured = "\n\n".join(parts)
+        # On current ScienceDirect, article sections are nested (not direct
+        # children), so the structured pass captures almost nothing. If it
+        # covers less than half the body text, fall back to the full text.
+        if len(structured) < 0.5 * len(raw):
+            return raw
+        if not structured:
+            return raw
 
-    # Fallback
+    # Fallback: the rendered article container. Strip obvious non-body
+    # regions (references, related content) before grabbing the text.
     if not parts:
-        article = soup.select_one("article") or soup.select_one("#main-content")
+        article = (
+            soup.select_one("article")
+            or soup.select_one("#main-content")
+            or soup.select_one("div.article-text")
+        )
         if article:
-            parts.append(_clean(article.get_text()))
+            for junk in article.select(
+                "#bibliography, section.bibliography, ol.references, "
+                "div.RecommendedArticles, div.recommended-articles, "
+                "section[aria-label='references']"
+            ):
+                junk.decompose()
+            text = _clean(article.get_text(" "))
+            if text:
+                parts.append(text)
 
     return "\n\n".join(parts)
 

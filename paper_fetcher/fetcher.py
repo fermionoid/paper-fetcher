@@ -364,6 +364,24 @@ class PaperFetcher:
         extracted = html_extractor.extract(resp.text, real_url)
         self._apply_extracted(paper, extracted)
 
+        # Some publishers (notably ScienceDirect) gate the article body behind
+        # a JavaScript anti-bot challenge that plain requests cannot pass — the
+        # served HTML is only an abstract/preview, which can still exceed the
+        # length threshold. So for these hosts we ALWAYS re-fetch with a headless
+        # browser (which executes the JS) and keep whichever text is longer,
+        # unless requests already returned a clearly full body.
+        if self._needs_js_render(real_url) and len(paper.full_text or "") < 6000:
+            logger.info("JS-gated host (%s): rendering with headless browser...", real_url)
+            rendered = self.auth.fetch_rendered(real_url)
+            if rendered:
+                extracted = html_extractor.extract(rendered, real_url)
+                if len(extracted.get("full_text") or "") > len(paper.full_text or ""):
+                    self._apply_extracted(paper, extracted)
+                    logger.info(
+                        "Headless render improved full text to %d chars",
+                        len(paper.full_text or ""),
+                    )
+
         # Always try to find and download PDF for local storage
         pdf_url = self._find_pdf_link(resp.text, real_url)
         if pdf_url:
@@ -467,6 +485,14 @@ class PaperFetcher:
                 return f"{base}{doi_part}"
 
         return None
+
+    # Hosts whose article body is rendered client-side behind a JS challenge,
+    # so a headless-browser render is needed to get the full text.
+    _JS_RENDER_HOSTS = ("sciencedirect.com", "linkinghub.elsevier.com")
+
+    def _needs_js_render(self, url: str) -> bool:
+        host = urlparse(url).netloc.lower()
+        return any(h in host for h in self._JS_RENDER_HOSTS)
 
     def _unproxy_url(self, url: str) -> str:
         """Convert an EZproxy-rewritten URL back to the original publisher URL.
